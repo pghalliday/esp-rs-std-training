@@ -129,14 +129,14 @@ impl ResponsePrinter {
                 // Update the total number of bytes read
                 total += size;
                 // recursive print to handle invalid UTF-8 sequences
-                self.print_utf8(size)?;
+                self.print_utf8(size);
             }
         }
         println!("Total: {} bytes", total);
         Ok(())
     }
 
-    fn print_utf8(&mut self, size: usize) -> Result<()> {
+    fn print_utf8(&mut self, size: usize) -> () {
         // remember that we read into an offset and recalculate the
         // real length of the bytes to decode
         let size_plus_offset = size + self.offset;
@@ -151,7 +151,11 @@ impl ResponsePrinter {
                 // A UTF-8 decode error was encountered, print
                 // the valid part and figure out what to do with the rest
                 let valid_up_to = error.valid_up_to();
-                print!("{}", str::from_utf8(&self.buffer[..valid_up_to])?);
+                // We know this is safe now as we are using the previously
+                // validated bytes
+                unsafe {
+                    print!("{}", str::from_utf8_unchecked(&self.buffer[..valid_up_to]));
+                }
                 if let Some(error_len) = error.error_len() {
                     // buffer contains invalid UTF-8 data, print a replacement
                     // character then copy the remainder (probably valid) to the
@@ -171,6 +175,5 @@ impl ResponsePrinter {
                 }
             }
         }
-        Ok(())
     }
 }
