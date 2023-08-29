@@ -1,18 +1,18 @@
-use anyhow::{bail, Result};
 use core::str;
+use std::fmt::{Debug, Display, Formatter};
+use std::error::Error;
+
+use anyhow::{bail, Result};
 use embedded_svc::{
     http::{client::Client, Status},
-    io::Read,
 };
+use embedded_svc::http::client::Response;
 use esp_idf_hal::prelude::Peripherals;
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     http::client::{Configuration, EspHttpConnection},
 };
 use wifi::wifi;
-
-// If using the `binstart` feature of `esp-idf-sys`, always keep this module imported
-use esp_idf_sys as _;
 
 #[toml_cfg::toml_config]
 pub struct Config {
@@ -21,6 +21,25 @@ pub struct Config {
     #[default("")]
     wifi_psk: &'static str,
 }
+
+#[derive(Debug)]
+enum HttpError {
+    HTTP3XXError,
+    HTTP4XXError,
+    HTTP5XXError,
+}
+
+impl Display for HttpError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpError::HTTP3XXError => write!(f, "3XX HTTP error"),
+            HttpError::HTTP4XXError => write!(f, "4XX HTTP error"),
+            HttpError::HTTP5XXError => write!(f, "5xx HTTP error"),
+        }
+    }
+}
+
+impl Error for HttpError {}
 
 fn main() -> Result<()> {
     esp_idf_sys::link_patches();
@@ -40,29 +59,118 @@ fn main() -> Result<()> {
         sysloop,
     )?;
 
-    get("http://neverssl.com/")?;
+    get("https://espressif.com/")?;
 
     Ok(())
 }
 
 fn get(url: impl AsRef<str>) -> Result<()> {
     // 1. Create a new EspHttpConnection with default Configuration. (Check documentation)
+    let configuration = Configuration {
+        use_global_ca_store: true,
+        crt_bundle_attach: Some(esp_idf_sys::esp_crt_bundle_attach),
+        ..Default::default()
+    };
+    let connection = EspHttpConnection::new(&configuration)?;
 
     // 2. Get a client using the Client::wrap method. (Check documentation)
+    let mut client = Client::wrap(connection);
 
     // 3. Open a GET request to `url`
+    let request = client.get(url.as_ref())?;
 
     // 4. Submit the request and check the status code of the response.
-    // let response = request...;
-    // let status = ...;
-    // println!("Response code: {}\n", status);
-    // match status {
-    // Successful http status codes are in the 200..=299 range.
+    let response = request.submit()?;
+    let status = Status::status(&response);
+    println!("Response code: {}\n", status);
+    let mut response_printer = ResponsePrinter::new();
+    match status {
+        // Successful http status codes are in the 200..=299 range.
+        200..=299 => return response_printer.print(response),
+        300..=399 => bail!(HttpError::HTTP3XXError),
+        400..=499 => bail!(HttpError::HTTP4XXError),
+        500..=599 => bail!(HttpError::HTTP5XXError),
+        _ => bail!("Unexpected response code: {}", status),
+    }
+}
 
-    // 5. If the status is OK, read response data chunk by chunk into a buffer and print it until done.
+const BUFFER_SIZE: usize = 256;
 
-    // 6. Try converting the bytes into a Rust (UTF-8) string and print it.
-    // }
+struct ResponsePrinter {
+    // Fixed buffer to read into
+    buffer: [u8; BUFFER_SIZE],
+    // Offset into the buffer to indicate that there are still
+    // bytes at the beginning that have not been decoded yet
+    offset: usize,
+}
 
-    Ok(())
+impl ResponsePrinter {
+    fn new() -> ResponsePrinter {
+        ResponsePrinter {
+            buffer: [0_u8; BUFFER_SIZE],
+            offset: 0,
+        }
+    }
+
+    fn print(&mut self, mut response: Response<&mut EspHttpConnection>) -> Result<()> {
+        // Keep track of the total number of bytes read to print later
+        let mut total = 0;
+        loop {
+            // read into the buffer starting at the offset to not overwrite
+            // the incomplete UTF-8 sequence we put there earlier
+            if let Ok(size) = response.read(&mut self.buffer[self.offset..]) {
+                if size == 0 {
+                    // no more bytes to read from the response
+                    if self.offset > 0 {
+                        bail!("Response ends with an invalid UTF-8 sequence with length: {}", self.offset)
+                    }
+                    break;
+                }
+                // Update the total number of bytes read
+                total += size;
+                // recursive print to handle invalid UTF-8 sequences
+                self.print_utf8(size)?;
+            }
+        }
+        println!("Total: {} bytes", total);
+        Ok(())
+    }
+
+    fn print_utf8(&mut self, size: usize) -> Result<()> {
+        // remember that we read into an offset and recalculate the
+        // real length of the bytes to decode
+        let size_plus_offset = size + self.offset;
+        match str::from_utf8(&self.buffer[..size_plus_offset]) {
+            Ok(text) => {
+                // buffer contains fully valid UTF-8 data,
+                // print it and reset the offset to 0
+                print!("{}", text);
+                self.offset = 0;
+            },
+            Err(error) => {
+                // A UTF-8 decode error was encountered, print
+                // the valid part and figure out what to do with the rest
+                let valid_up_to = error.valid_up_to();
+                print!("{}", str::from_utf8(&self.buffer[..valid_up_to])?);
+                if let Some(error_len) = error.error_len() {
+                    // buffer contains invalid UTF-8 data, print a replacement
+                    // character then copy the remainder (probably valid) to the
+                    // beginning of the buffer, reset the offset and deal with
+                    // the remainder in a recursive call to print_utf8
+                    print!("{}", char::REPLACEMENT_CHARACTER);
+                    let valid_after = valid_up_to + error_len;
+                    self.buffer.copy_within(valid_after.., 0);
+                    self.offset = 0;
+                    return self.print_utf8(size_plus_offset - valid_after);
+                } else {
+                    // buffer contains incomplete UTF-8 data, copy the invalid
+                    // sequence to the beginning of the buffer and set an offset
+                    // for the next read
+                    self.buffer.copy_within(valid_up_to.., 0);
+                    self.offset = size_plus_offset - valid_up_to;
+                }
+            }
+        }
+        Ok(())
+    }
 }
